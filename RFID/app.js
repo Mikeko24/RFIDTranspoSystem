@@ -117,8 +117,11 @@ let editingCompanyId = null;
 let editingDestinationId = null;
 let selectedPassengerId = state.passengers[0]?.id ?? null;
 let selectedCompanyVehicleId = null;
+let companyView = "fares";
 let modal = null;
 let message = "";
+let toast = null;
+let toastTimer = null;
 let landingTab = "register";
 let routeStopDrafts = [];
 
@@ -166,18 +169,7 @@ function normalizeState(raw) {
         ...company,
         email: company.email || "",
         password: company.password || "",
-        vehicles: Array.isArray(company.vehicles)
-          ? company.vehicles.map((vehicle) => ({
-              routeFrom: "",
-              routeTo: "",
-              pricingMode: "Fixed fare",
-              distanceKm: 0,
-              pricePerKm: 0,
-              status: "Active",
-              fare: 15,
-              ...vehicle,
-            }))
-          : [],
+        vehicles: normalizeCompanyVehicles(company.vehicles),
       }))
     : defaultCompanies;
   const accounts = Array.isArray(raw.accounts)
@@ -194,7 +186,7 @@ function normalizeState(raw) {
     sessionCompanyId: raw.sessionCompanyId || null,
     nextId: raw.nextId || 1005,
     nextCompanyId: raw.nextCompanyId || Math.max(5002, ...companies.map((company) => company.id + 1)),
-    nextVehicleId: raw.nextVehicleId || Math.max(9002, ...companies.flatMap((company) => company.vehicles.map((vehicle) => vehicle.id + 1))),
+    nextVehicleId: raw.nextVehicleId || Math.max(9002, ...companies.flatMap((company) => companyFareProfiles(company).map((vehicle) => vehicle.id + 1))),
     nextDestinationId: raw.nextDestinationId || Math.max(7005, ...destinations.map((destination) => destination.id + 1)),
     passengers,
     accounts,
@@ -202,6 +194,61 @@ function normalizeState(raw) {
     destinations,
     transactions: Array.isArray(raw.transactions) ? raw.transactions : [],
   };
+}
+
+function normalizeCompanyVehicles(vehicles) {
+  const normalized = Array.isArray(vehicles)
+    ? vehicles.map((vehicle) => ({
+        routeFrom: "",
+        routeTo: "",
+        routeFares: [],
+        pricingMode: "Fixed fare",
+        distanceKm: 0,
+        pricePerKm: 0,
+        status: "Active",
+        fare: 15,
+        ...vehicle,
+        routeFares: Array.isArray(vehicle.routeFares)
+          ? vehicle.routeFares.map((routeFare) => ({
+              id: routeFare.id,
+              routeFrom: routeFare.routeFrom || vehicle.routeFrom || "",
+              routeTo: routeFare.routeTo || "",
+              destinationId: routeFare.destinationId || null,
+              pricingMode: "Fixed fare",
+              distanceKm: 0,
+              pricePerKm: 0,
+              fare: 15,
+              status: "Active",
+              ...routeFare,
+            }))
+          : [],
+      }))
+    : [];
+
+  const baseVehicles = normalized.filter((vehicle) => !vehicle.baseRouteTo);
+  const legacyRouteFares = normalized.filter((vehicle) => vehicle.baseRouteTo);
+  const migratedLegacyIds = new Set();
+
+  const migratedBaseVehicles = baseVehicles.map((vehicle) => {
+    const matchingLegacyRoutes = legacyRouteFares
+      .filter((routeFare) => routeFare.name === vehicle.name && routeFare.plate === vehicle.plate && routeFare.baseRouteTo === vehicle.routeTo)
+      .map((routeFare) => ({
+        id: routeFare.id,
+        routeFrom: routeFare.routeFrom || vehicle.routeFrom,
+        routeTo: routeFare.routeTo,
+        destinationId: routeFare.destinationId || null,
+        pricingMode: routeFare.pricingMode || "Fixed fare",
+        distanceKm: Number(routeFare.distanceKm || 0),
+        pricePerKm: Number(routeFare.pricePerKm || 0),
+        fare: Number(routeFare.fare || 0),
+        status: routeFare.status || "Active",
+      }));
+    matchingLegacyRoutes.forEach((routeFare) => migratedLegacyIds.add(routeFare.id));
+
+    return { ...vehicle, routeFares: [...(vehicle.routeFares || []), ...matchingLegacyRoutes] };
+  });
+
+  return [...migratedBaseVehicles, ...legacyRouteFares.filter((vehicle) => !migratedLegacyIds.has(vehicle.id))];
 }
 
 function transactionSeed(passengerId, type, amount, balanceAfter, details = {}) {
@@ -257,16 +304,37 @@ function icon(name) {
       '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 6V5a2 2 0 0 1 2-2h7v18h-7a2 2 0 0 1-2-2v-1M4 12h11M12 8l4 4-4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     menu:
       '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    chevron:
+      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    eye:
+      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/></svg>',
   };
   return icons[name] || "";
 }
 
 function render() {
   const app = document.querySelector("#app");
-  if (state.isLoggedIn && state.role === "passenger") app.innerHTML = renderPassengerPortal();
-  else if (state.isLoggedIn && state.role === "company") app.innerHTML = renderCompanyPortal();
-  else app.innerHTML = state.isLoggedIn ? renderShell() : renderLanding();
+  let content = "";
+  if (state.isLoggedIn && state.role === "passenger") content = renderPassengerPortal();
+  else if (state.isLoggedIn && state.role === "company") content = renderCompanyPortal();
+  else content = state.isLoggedIn ? renderShell() : renderLanding();
+  app.innerHTML = `${content}${renderToast()}`;
   bindEvents();
+}
+
+function renderToast() {
+  if (!toast) return "";
+  return `<div class="toast ${toast.type}" role="status">${escapeHtml(toast.message)}</div>`;
+}
+
+function showToast(messageText, type = "danger") {
+  toast = { message: messageText, type };
+  if (toastTimer) window.clearTimeout(toastTimer);
+  render();
+  toastTimer = window.setTimeout(() => {
+    toast = null;
+    render();
+  }, 3200);
 }
 
 function renderLanding() {
@@ -307,11 +375,14 @@ function renderLogin() {
       </div>
       <div class="field">
         <label for="username">Email</label>
-        <input id="username" autocomplete="username" placeholder="name@example.com" value="admin" />
+        <input id="username" autocomplete="username" placeholder="name@example.com" />
       </div>
       <div class="field">
         <label for="password">Password</label>
-        <input id="password" type="password" autocomplete="current-password" value="admin123" />
+        <div class="password-control">
+          <input id="password" type="password" autocomplete="current-password" placeholder="Enter password" />
+          <button class="password-toggle" type="button" data-action="togglePassword" aria-label="Show password" aria-pressed="false">${icon("eye")}</button>
+        </div>
       </div>
       <button class="btn primary" type="submit">Login</button>
       <div class="hint">Admin demo: admin / admin123. Company demo: company@example.com / company123.</div>
@@ -351,14 +422,13 @@ function renderShell() {
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand-row"><div class="brand-mark">${icon("radio")}</div><span>RFID Transit Ledger</span></div>
-        <div class="admin-mini"><div class="avatar">A</div><div><strong>Admin</strong><br><span class="online">Online</span></div></div>
+        <div class="admin-mini"><div class="avatar">A</div><div><strong>Admin Console</strong><span class="online">Online</span></div></div>
         <nav class="nav-list">${navButtons()}</nav>
         <button class="nav-button logout" data-action="logout">${icon("logout")} Logout</button>
       </aside>
       <main class="main">
         <header class="topbar">
           <div class="mobile-brand"><button class="btn icon mobile-menu" data-action="view" data-view="dashboard">${icon("menu")}</button><strong>RFID Transit Ledger</strong></div>
-          <button class="btn mobile-logout" data-action="logout">${icon("logout")} Logout</button>
           <div class="desktop-meta">${new Date().toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" })} &middot; Local prototype</div>
         </header>
         <section class="page">${renderView()}</section>
@@ -372,7 +442,8 @@ function renderShell() {
 function renderCompanyPortal() {
   const company = state.companies.find((item) => item.id === state.sessionCompanyId);
   const vehicles = company?.vehicles || [];
-  const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedCompanyVehicleId) || vehicles[0];
+  const fareProfiles = companyFareProfiles(company);
+  const selectedVehicle = fareProfiles.find((vehicle) => vehicle.id === selectedCompanyVehicleId) || fareProfiles[0];
   if (selectedVehicle && selectedCompanyVehicleId !== selectedVehicle.id) selectedCompanyVehicleId = selectedVehicle.id;
   const selectedPassenger = state.passengers.find((p) => p.id === selectedPassengerId) || state.passengers[0];
   const companyTransactions = state.transactions
@@ -381,6 +452,28 @@ function renderCompanyPortal() {
     .reverse()
     .map(renderTransaction)
     .join("");
+  const stats = renderCompanyStats(company, fareProfiles, selectedVehicle);
+  let pageContent = "";
+
+  if (companyView === "scan") {
+    pageContent = `
+      ${stats}
+      ${renderCompanyScan(company, selectedVehicle, selectedPassenger)}
+    `;
+  } else if (companyView === "transactions") {
+    pageContent = `
+      ${stats}
+      <section class="panel">
+        <div class="panel-header"><h2>Company Transactions</h2></div>
+        <div class="transactions-list">${companyTransactions || `<div class="empty-state">No company ride transactions yet.</div>`}</div>
+      </section>
+    `;
+  } else {
+    pageContent = `
+      ${stats}
+      ${renderCompanyVehicles(company)}
+    `;
+  }
 
   return `
     <div class="app-shell">
@@ -391,40 +484,59 @@ function renderCompanyPortal() {
           <span>Account email</span>
           <strong>${escapeHtml(company?.email || "")}</strong>
         </div>
+        <nav class="nav-list">${companyNavButtons()}</nav>
         <button class="nav-button logout" data-action="logout">${icon("logout")} Logout</button>
       </aside>
       <main class="main">
         <header class="topbar">
           <div class="mobile-brand"><strong>${escapeHtml(company?.name || "Bus Company")}</strong></div>
-          <button class="btn mobile-logout" data-action="logout">${icon("logout")} Logout</button>
-          <div class="desktop-meta">Company fare console</div>
+          <div class="desktop-meta">${companyView === "scan" ? "Scan ride console" : companyView === "transactions" ? "Company transactions" : "Company fare console"}</div>
         </header>
-        <section class="page">
-          <div class="stats-grid">
-            <div class="stat"><span class="stat-label">Fare Profiles</span><strong>${vehicles.length}</strong><small>Routes and vehicles</small></div>
-            <div class="stat"><span class="stat-label">Company Rides</span><strong>${state.transactions.filter((tx) => tx.companyId === company?.id && tx.amount < 0).length}</strong><small>Scans recorded</small></div>
-            <div class="stat"><span class="stat-label">Selected Fare</span><strong>${selectedVehicle ? peso(selectedVehicle.fare) : "0.00"}</strong><small>${escapeHtml(routeLabel(selectedVehicle) || "No route")}</small></div>
-            <div class="stat"><span class="stat-label">Passengers</span><strong>${state.passengers.length}</strong><small>Available cards</small></div>
-          </div>
-          <div class="workspace">
-            ${renderCompanyVehicles(company)}
-            ${renderCompanyScan(company, selectedVehicle, selectedPassenger)}
-          </div>
-          <section class="panel">
-            <div class="panel-header"><h2>Company Transactions</h2></div>
-            <div class="transactions-list">${companyTransactions || `<div class="empty-state">No company ride transactions yet.</div>`}</div>
-          </section>
-        </section>
+        <section class="page">${pageContent}</section>
+        <nav class="bottom-tabs company-tabs">${companyMobileTabs()}</nav>
       </main>
     </div>
     ${modal ? renderModal() : ""}
   `;
 }
 
+function renderCompanyStats(company, fareProfiles, selectedVehicle) {
+  return `
+    <div class="stats-grid">
+      <div class="stat"><span class="stat-label">Fare Profiles</span><strong>${fareProfiles.length}</strong><small>Routes and vehicles</small></div>
+      <div class="stat"><span class="stat-label">Company Rides</span><strong>${state.transactions.filter((tx) => tx.companyId === company?.id && tx.amount < 0).length}</strong><small>Scans recorded</small></div>
+      <div class="stat"><span class="stat-label">Selected Fare</span><strong>${selectedVehicle ? peso(selectedVehicle.fare) : "0.00"}</strong><small>${escapeHtml(routeLabel(selectedVehicle) || "No route")}</small></div>
+      <div class="stat"><span class="stat-label">Passengers</span><strong>${state.passengers.length}</strong><small>Available cards</small></div>
+    </div>
+  `;
+}
+
+function companyNavButtons() {
+  const items = [
+    ["fares", "Fare Profiles", "bus"],
+    ["scan", "Scan Ride", "radio"],
+    ["transactions", "Transactions", "list"],
+  ];
+  return items
+    .map(([view, label, iconName]) => `<button class="nav-button ${companyView === view ? "active" : ""}" data-action="companyView" data-view="${view}">${icon(iconName)} ${label}</button>`)
+    .join("");
+}
+
+function companyMobileTabs() {
+  const items = [
+    ["fares", "Fares", "bus"],
+    ["scan", "Scan", "radio"],
+    ["transactions", "Trips", "list"],
+  ];
+  return items
+    .map(([view, label, iconName]) => `<button class="${companyView === view ? "active" : ""}" data-action="companyView" data-view="${view}">${icon(iconName)}<span>${label}</span></button>`)
+    .join("");
+}
+
 function renderCompanyVehicles(company) {
   const rows = (company?.vehicles || [])
     .map((vehicle) => `
-      <tr class="clickable-row" data-action="openRouteModal" data-id="${vehicle.id}" title="Add another route fare for this bus">
+      <tr class="clickable-row" data-action="openRouteModal" data-id="${vehicle.id}" title="View and add route fares for this bus">
         <td><strong>${escapeHtml(vehicle.name)}</strong><br><small>${escapeHtml(vehicle.plate)}</small></td>
         <td>${escapeHtml(routeLabel(vehicle) || "No route stated")}</td>
         <td>${escapeHtml(pricingLabel(vehicle))}</td>
@@ -432,7 +544,7 @@ function renderCompanyVehicles(company) {
         <td style="font-weight:900">PHP ${peso(vehicle.fare)}</td>
         <td><span class="status ${vehicle.status.toLowerCase()}">${escapeHtml(vehicle.status)}</span></td>
         <td><div class="row-actions">
-          <button class="btn icon" title="Add route fare" data-action="openRouteModal" data-id="${vehicle.id}">${icon("plus")}</button>
+          <button class="btn icon" title="View routes" data-action="openRouteModal" data-id="${vehicle.id}">${icon("plus")}</button>
           <button class="btn icon danger" title="Delete vehicle" data-action="deleteVehicle" data-id="${vehicle.id}">${icon("trash")}</button>
         </div></td>
       </tr>
@@ -446,12 +558,21 @@ function renderCompanyVehicles(company) {
         <div class="form-grid">
           ${input("vehicleName", "Vehicle Name", "", "Bus 101")}
           ${input("vehiclePlate", "Plate / Unit Number", "", "ABC 1234")}
-          ${input("routeFrom", "From Location", "", "Terminal A")}
-          ${input("routeTo", "To Location", "", "Terminal B")}
-          ${select("pricingMode", "Pricing Type", ["Fixed fare", "Per kilometer"], "Fixed fare")}
-          ${input("vehicleFare", "Fixed Fare (PHP)", "15.00", "0.00", "number", "0.01")}
-          ${input("distanceKm", "Distance (KM)", "", "0", "number", "0.01")}
-          ${input("pricePerKm", "Price per KM (PHP)", "", "0.00", "number", "0.01")}
+          ${input("routeFrom", "From Location", "", "Naga City - Cebu")}
+          ${input("routeTo", "To Location", "", "Toledo - Cebu")}
+          ${select("pricingMode", "Pricing Type", ["Fixed fare", "Per kilometer"], "Fixed fare", `data-action="pricingMode"`)}
+          <div class="field pricing-field fixed-fare-field">
+            <label for="vehicleFare">Fixed Fare (PHP)</label>
+            <input id="vehicleFare" name="vehicleFare" type="number" step="0.01" value="15.00" placeholder="0.00" />
+          </div>
+          <div class="field pricing-field per-km-field is-hidden">
+            <label for="distanceKm">Distance (KM)</label>
+            <input id="distanceKm" name="distanceKm" type="number" step="0.01" placeholder="0" disabled />
+          </div>
+          <div class="field pricing-field per-km-field is-hidden">
+            <label for="pricePerKm">Price per KM (PHP)</label>
+            <input id="pricePerKm" name="pricePerKm" type="number" step="0.01" placeholder="0.00" disabled />
+          </div>
           ${select("vehicleStatus", "Status", ["Active", "Inactive"], "Active")}
         </div>
         <div class="actions"><button class="btn primary" type="submit">${icon("plus")} Add Fare Profile</button></div>
@@ -471,18 +592,18 @@ function renderCompanyScan(company, selectedVehicle, selectedPassenger) {
     <section class="panel">
       <div class="panel-header"><h2>Scan Ride</h2></div>
       <div class="scan-panel">
+        <div class="rfid-symbol scan-logo">${icon("radio")}</div>
         <div class="field"><label for="companyVehicle">Vehicle / Location Fare</label><select id="companyVehicle" data-action="selectVehicle">${vehicleOptions(company, selectedVehicle?.id)}</select></div>
         <div class="field"><label for="companyPassenger">Tap card or choose passenger</label><select id="companyPassenger" data-action="selectPassenger">${passengerOptions(selectedPassenger?.id)}</select></div>
-        <div class="rfid-symbol">${icon("radio")}</div>
         <div class="scan-identity">
           <strong>${escapeHtml(selectedPassenger?.rfid || "No card selected")}</strong>
           <span>${escapeHtml(selectedPassenger?.name || "Register a passenger first")}</span>
         </div>
         <div class="route-summary">
-          <span>${escapeHtml(selectedVehicle ? routeLabel(selectedVehicle) || "No route stated" : "No fare profile selected")}</span>
-          <small>${escapeHtml(selectedVehicle ? pricingLabel(selectedVehicle) : "")}</small>
+          <div><small>Route</small><strong>${escapeHtml(selectedVehicle ? routeLabel(selectedVehicle) || "No route stated" : "No fare profile selected")}</strong></div>
+          <div><small>Pricing</small><strong>${escapeHtml(selectedVehicle ? pricingLabel(selectedVehicle) : "No fare")}</strong></div>
         </div>
-        <div class="balance-box"><span>Location Fare (PHP)</span><strong>${peso(selectedVehicle?.fare || 0)}</strong></div>
+        <div class="balance-box fare-box"><span>Fare Amount (PHP)</span><strong>${peso(selectedVehicle?.fare || 0)}</strong></div>
         <button class="btn primary" data-action="companyDeductFare" ${selectedVehicle ? "" : "disabled"}>Deduct Location Fare</button>
         ${message ? `<div class="alert ${message.includes("Insufficient") || message.includes("inactive") || message.includes("vehicle") ? "danger" : "success"}">${escapeHtml(message)}</div>` : ""}
       </div>
@@ -504,8 +625,14 @@ function renderPassengerPortal() {
       <section class="passenger-card">
         <div class="brand-row"><div class="brand-mark">${icon("radio")}</div><strong>RFID Transit Ledger</strong></div>
         <div class="passenger-summary">
-          <span>${escapeHtml(passenger?.rfid || "No card")}</span>
-          <h1>${escapeHtml(passenger?.name || "Passenger")}</h1>
+          <div class="passenger-id-card">
+            <span>Card ID</span>
+            <strong>${escapeHtml(passenger?.rfid || "No card")}</strong>
+          </div>
+          <div class="passenger-title">
+            <span>Passenger</span>
+            <h1>${escapeHtml(passenger?.name || "Passenger")}</h1>
+          </div>
           <div class="balance-box"><span>Available Balance (PHP)</span><strong>${peso(passenger?.balance || 0)}</strong></div>
         </div>
         <form id="passengerTopUpForm" class="passenger-topup">
@@ -516,12 +643,14 @@ function renderPassengerPortal() {
           <button class="btn primary" type="submit">Top Up Balance</button>
           ${message ? `<div class="alert success">${escapeHtml(message)}</div>` : ""}
         </form>
-        <button class="btn" data-action="logout">Logout</button>
       </section>
       <section class="panel passenger-history">
         <div class="panel-header"><h2>My Transactions</h2></div>
         <div class="transactions-list">${history || `<div class="empty-state">No transactions yet.</div>`}</div>
       </section>
+      <nav class="passenger-bottom-nav">
+        <button data-action="logout">${icon("logout")}<span>Logout</span></button>
+      </nav>
     </main>
   `;
 }
@@ -563,13 +692,71 @@ function renderView() {
   if (currentView === "passengers") return renderPassengers();
   if (currentView === "transactions") return renderTransactions();
 
+  return renderDashboard();
+}
+
+function renderDashboard() {
+  const recentTransactions = state.transactions
+    .slice()
+    .reverse()
+    .slice(0, 5)
+    .map(renderTransaction)
+    .join("");
+  const lowBalanceRows = state.passengers
+    .filter((passenger) => Number(passenger.balance) <= 20 || passenger.status !== "Active")
+    .slice(0, 5)
+    .map(
+      (passenger) => `
+        <div class="watch-row">
+          <div>
+            <strong>${escapeHtml(passenger.name)}</strong>
+            <small>${escapeHtml(passenger.rfid)} &middot; ${escapeHtml(passenger.status)}</small>
+          </div>
+          <span class="${Number(passenger.balance) <= 20 ? "amount-debit" : ""}">PHP ${peso(passenger.balance)}</span>
+        </div>
+      `,
+    )
+    .join("");
+  const activeCompanies = state.companies.filter((company) => company.status === "Active").length;
+  const activePassengers = state.passengers.filter((passenger) => passenger.status === "Active").length;
+  const routes = state.companies.reduce((sum, company) => sum + companyFareProfiles(company).length, 0);
+
   return `
     ${renderStats()}
-    <div class="workspace">
-      ${renderRegister()}
-      ${renderScan()}
-    </div>
-    ${renderPassengers(true)}
+    <section class="panel dashboard-intro">
+      <div>
+        <h2>Admin Console</h2>
+        <p>Monitor card activity, operator setup, passenger balances, and route readiness from one overview.</p>
+      </div>
+      <button class="btn primary" data-action="view" data-view="register">${icon("plus")} Register Card</button>
+    </section>
+    <section class="dashboard-grid">
+      <div class="panel compact-panel">
+        <div class="panel-header"><h2>Quick Actions</h2></div>
+        <div class="quick-actions">
+          <button class="btn primary" data-action="view" data-view="register">${icon("plus")} Register Card</button>
+          <button class="btn" data-action="view" data-view="passengers">${icon("list")} Manage Passengers</button>
+          <button class="btn" data-action="view" data-view="topup">${icon("plus")} Top Up Balance</button>
+          <button class="btn" data-action="view" data-view="scan">${icon("radio")} Scan Ride</button>
+        </div>
+      </div>
+      <div class="panel compact-panel">
+        <div class="panel-header"><h2>System Readiness</h2></div>
+        <div class="readiness-list">
+          <div><span>Active passengers</span><strong>${activePassengers}/${state.passengers.length}</strong></div>
+          <div><span>Active companies</span><strong>${activeCompanies}/${state.companies.length}</strong></div>
+          <div><span>Fare profiles</span><strong>${routes}</strong></div>
+        </div>
+      </div>
+      <div class="panel compact-panel">
+        <div class="panel-header"><h2>Needs Attention</h2></div>
+        <div class="watch-list">${lowBalanceRows || `<div class="empty-state compact-empty">No low-balance or inactive passengers.</div>`}</div>
+      </div>
+      <div class="panel compact-panel">
+        <div class="panel-header"><h2>Recent Activity</h2></div>
+        <div class="transactions-list compact-transactions">${recentTransactions || `<div class="empty-state compact-empty">No transactions yet.</div>`}</div>
+      </div>
+    </section>
   `;
 }
 
@@ -737,11 +924,11 @@ function renderScan() {
     <section class="panel">
       <div class="panel-header"><h2>Scan Ride</h2></div>
       <div class="scan-panel">
+        <div class="rfid-symbol scan-logo">${icon("radio")}</div>
         <div class="field">
           <label for="scanPassenger">Tap card on reader or choose passenger</label>
           <select id="scanPassenger" data-action="selectPassenger">${passengerOptions(selected?.id)}</select>
         </div>
-        <div class="rfid-symbol">${icon("radio")}</div>
         <div class="scan-identity">
           <strong>${escapeHtml(selected?.rfid || "No card selected")}</strong>
           <span>${escapeHtml(selected?.name || "Register a passenger first")}</span>
@@ -866,9 +1053,19 @@ function renderRouteStopModal() {
   const company = state.companies.find((item) => item.id === modal.companyId);
   const baseVehicle = company?.vehicles.find((vehicle) => vehicle.id === modal.vehicleId);
   const baseRoute = routeLabel(baseVehicle) || "No base route stated";
-  const destinationOptions = state.destinations
-    .filter((destination) => destination.status === "Active")
-    .map((destination) => `<option value="${destination.id}">${escapeHtml(destination.name)}${destination.area ? ` - ${escapeHtml(destination.area)}` : ""}</option>`)
+  const editingRoute = baseVehicle?.routeFares?.find((routeFare) => routeFare.id === modal.editingRouteFareId);
+  const destinationOptions = renderRouteDestinationOptions();
+  const existingRows = (baseVehicle?.routeFares || [])
+    .map((routeFare) => `
+      <tr>
+        <td>${escapeHtml(routeFare.routeTo || "No destination")}</td>
+        <td style="font-weight:900">PHP ${peso(routeFare.fare)}</td>
+        <td><div class="row-actions">
+          <button class="btn icon" type="button" title="Edit route fare" data-action="editRouteFare" data-id="${baseVehicle.id}" data-route-id="${routeFare.id}">${icon("edit")}</button>
+          <button class="btn icon danger" type="button" title="Delete route fare" data-action="deleteRouteFare" data-id="${baseVehicle.id}" data-route-id="${routeFare.id}">${icon("trash")}</button>
+        </div></td>
+      </tr>
+    `)
     .join("");
   const draftRows = routeStopDrafts
     .map((draft, index) => `
@@ -898,18 +1095,21 @@ function renderRouteStopModal() {
           </div>
           <div class="route-draft-grid">
             <div class="field">
-              <label for="routeDestinationSearch">Search Destination</label>
-              <input id="routeDestinationSearch" placeholder="Search Naga, Uling, Lutopan..." data-action="filterRouteDestinations" />
-            </div>
-            <div class="field">
               <label for="routeStopDestination">Passenger Destination / Stop</label>
-              <select id="routeStopDestination" name="routeStopDestination">${destinationOptions}</select>
+              <div class="custom-combobox" id="routeDestinationCombobox">
+                <div class="custom-combobox-control">
+                  <input id="routeStopDestination" name="routeStopDestination" value="${escapeHtml(editingRoute?.routeTo || "")}" placeholder="Type passenger destination" autocomplete="off" data-action="filterRouteDestinations" />
+                  <button class="custom-combobox-toggle" type="button" data-action="toggleRouteDestinations" aria-label="Show passenger destinations">${icon("chevron")}</button>
+                </div>
+                <div class="custom-options" id="passengerDestinationList">${destinationOptions}</div>
+              </div>
             </div>
             <div class="field">
               <label for="routeStopFare">Fixed Fare (PHP)</label>
-              <input id="routeStopFare" name="routeStopFare" type="number" min="1" step="0.01" value="15.00" />
+              <input id="routeStopFare" name="routeStopFare" type="number" min="1" step="0.01" value="${peso(editingRoute?.fare || 15)}" />
             </div>
-            <button class="btn" type="button" data-action="addRouteDraft">${icon("plus")} Add to List</button>
+            <button class="btn" type="button" data-action="addRouteDraft">${editingRoute ? icon("edit") + " Save Edit" : icon("plus") + " Add to List"}</button>
+            ${editingRoute ? `<button class="btn" type="button" data-action="cancelRouteFareEdit">Cancel Edit</button>` : ""}
           </div>
           <div class="table-wrap compact-table">
             <table>
@@ -917,7 +1117,13 @@ function renderRouteStopModal() {
               <tbody>${draftRows || `<tr><td colspan="3"><div class="empty-state">Add one or more destinations before saving.</div></td></tr>`}</tbody>
             </table>
           </div>
-          <div class="hint">This adds new fixed-fare profiles for the same bus. Existing routes are not changed.</div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead><tr><th>Existing Route</th><th>Fixed Fare</th><th>Actions</th></tr></thead>
+              <tbody>${existingRows || `<tr><td colspan="3"><div class="empty-state">No extra routes saved for this bus yet.</div></td></tr>`}</tbody>
+            </table>
+          </div>
+          <div class="hint">Passenger destination choices come from the admin Passenger Destination page. New route fares are saved under this bus.</div>
           <button class="btn primary" type="submit">Save Route Fares</button>
         </form>
       </section>
@@ -929,8 +1135,40 @@ function input(name, label, value, placeholder, type = "text", step = "", attrib
   return `<div class="field"><label for="${name}">${label}</label><input id="${name}" name="${name}" type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" ${step ? `step="${step}"` : ""} ${attributes} /></div>`;
 }
 
-function select(name, label, options, value) {
-  return `<div class="field select-field"><label for="${name}">${label}</label><select id="${name}" name="${name}">${options.map((option) => `<option ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select></div>`;
+function select(name, label, options, value, attributes = "") {
+  return `<div class="field select-field"><label for="${name}">${label}</label><select id="${name}" name="${name}" ${attributes}>${options.map((option) => `<option ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select></div>`;
+}
+
+function passengerDestinationLabel(destination) {
+  if (!destination) return "";
+  return `${destination.name}${destination.area ? ` - ${destination.area}` : ""}`;
+}
+
+function passengerDestinationOptions(selectedValue = "") {
+  return state.destinations
+    .filter((destination) => destination.status === "Active")
+    .map((destination) => {
+      const label = passengerDestinationLabel(destination);
+      return `<option value="${escapeHtml(label)}" ${label === selectedValue ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+}
+
+function renderRouteDestinationOptions(query = "") {
+  const normalized = query.trim().toLowerCase();
+  const options = state.destinations
+    .filter((destination) => {
+      if (destination.status !== "Active") return false;
+      if (!normalized) return true;
+      return [destination.name, destination.area].join(" ").toLowerCase().includes(normalized);
+    })
+    .map((destination) => {
+      const label = passengerDestinationLabel(destination);
+      return `<button class="custom-option" type="button" data-action="selectRouteDestination" data-value="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
+    })
+    .join("");
+
+  return options || `<div class="custom-option empty">No match. Add to List creates it.</div>`;
 }
 
 function passengerOptions(selectedId) {
@@ -940,10 +1178,26 @@ function passengerOptions(selectedId) {
 }
 
 function vehicleOptions(company, selectedId) {
-  const vehicles = company?.vehicles || [];
+  const vehicles = companyFareProfiles(company);
   return vehicles
     .map((vehicle) => `<option value="${vehicle.id}" ${vehicle.id === selectedId ? "selected" : ""}>${escapeHtml(vehicle.name)} - ${escapeHtml(routeLabel(vehicle) || "No route")} - PHP ${peso(vehicle.fare)}</option>`)
     .join("");
+}
+
+function companyFareProfiles(company) {
+  return (company?.vehicles || []).flatMap((vehicle) => [
+    vehicle,
+    ...(vehicle.routeFares || []).map((routeFare) => ({
+      ...vehicle,
+      ...routeFare,
+      id: routeFare.id,
+      baseVehicleId: vehicle.id,
+      routeFareId: routeFare.id,
+      name: vehicle.name,
+      plate: vehicle.plate,
+      isRouteFare: true,
+    })),
+  ]);
 }
 
 function routeLabel(vehicle) {
@@ -967,6 +1221,22 @@ function calculateVehicleFare(data) {
     return Number(data.distanceKm || 0) * Number(data.pricePerKm || 0);
   }
   return Number(data.vehicleFare || 0);
+}
+
+function updatePricingFields(pricingMode) {
+  const isPerKm = pricingMode === "Per kilometer";
+  document.querySelectorAll(".fixed-fare-field").forEach((field) => {
+    field.classList.toggle("is-hidden", isPerKm);
+    field.querySelectorAll("input").forEach((inputEl) => {
+      inputEl.disabled = isPerKm;
+    });
+  });
+  document.querySelectorAll(".per-km-field").forEach((field) => {
+    field.classList.toggle("is-hidden", !isPerKm);
+    field.querySelectorAll("input").forEach((inputEl) => {
+      inputEl.disabled = !isPerKm;
+    });
+  });
 }
 
 function randomRfid() {
@@ -1007,6 +1277,9 @@ function bindEvents() {
   const passengerTopUpForm = document.querySelector("#passengerTopUpForm");
   if (passengerTopUpForm) passengerTopUpForm.onsubmit = passengerTopUp;
 
+  const pricingMode = document.querySelector("#pricingMode");
+  if (pricingMode) updatePricingFields(pricingMode.value);
+
   const app = document.querySelector("#app");
   app.onclick = handleAction;
   app.onchange = handleAction;
@@ -1033,6 +1306,7 @@ function login(event) {
     state.role = "company";
     state.sessionPassengerId = null;
     state.sessionCompanyId = company.id;
+    companyView = "fares";
     selectedCompanyVehicleId = company.vehicles[0]?.id ?? null;
     persist();
     render();
@@ -1063,16 +1337,29 @@ function handleAction(event) {
   const action = target.dataset.action;
   const id = Number(target.dataset.id);
 
-  if (event.type === "click" && (target.tagName === "SELECT" || action === "selectPassenger" || action === "selectVehicle" || action === "search" || action === "searchDestinations" || action === "filterRouteDestinations")) return;
+  if (event.type === "click" && (target.tagName === "SELECT" || action === "selectPassenger" || action === "selectVehicle" || action === "pricingMode" || action === "search" || action === "searchDestinations")) return;
   if (event.type === "input" && action !== "search" && action !== "searchDestinations" && action !== "filterRouteDestinations") return;
-  if (event.type === "change" && action !== "selectPassenger" && action !== "selectVehicle") return;
+  if (event.type === "change" && action !== "selectPassenger" && action !== "selectVehicle" && action !== "pricingMode") return;
 
   if (action === "landingTab") {
     landingTab = target.dataset.tab;
     render();
   }
+  if (action === "togglePassword") {
+    const input = document.querySelector("#password");
+    if (!input) return;
+    const willShow = input.type === "password";
+    input.type = willShow ? "text" : "password";
+    target.setAttribute("aria-label", willShow ? "Hide password" : "Show password");
+    target.setAttribute("aria-pressed", String(willShow));
+  }
   if (action === "view") {
     currentView = target.dataset.view;
+    message = "";
+    render();
+  }
+  if (action === "companyView") {
+    companyView = target.dataset.view;
     message = "";
     render();
   }
@@ -1115,10 +1402,12 @@ function handleAction(event) {
   if (action === "deleteDestination") deleteDestination(id);
   if (action === "openRouteModal") {
     routeStopDrafts = [];
-    modal = { type: "routeStop", companyId: state.sessionCompanyId, vehicleId: id };
+    modal = { type: "routeStop", companyId: state.sessionCompanyId, vehicleId: id, editingRouteFareId: null };
     render();
   }
   if (action === "deleteVehicle") deleteVehicle(id);
+  if (action === "deleteRouteFare") deleteRouteFare(id, Number(target.dataset.routeId));
+  if (action === "editRouteFare") editRouteFare(Number(target.dataset.routeId));
   if (action === "deletePassenger") deletePassenger(id);
   if (action === "openTopUp") {
     modal = { passengerId: id };
@@ -1134,6 +1423,12 @@ function handleAction(event) {
   if (action === "deductFare") deductFare(Number(document.querySelector("#fare").value));
   if (action === "companyDeductFare") companyDeductFare();
   if (action === "addRouteDraft") addRouteDraft();
+  if (action === "cancelRouteFareEdit") {
+    modal = { ...modal, editingRouteFareId: null };
+    render();
+  }
+  if (action === "toggleRouteDestinations") toggleRouteDestinationOptions();
+  if (action === "selectRouteDestination") selectRouteDestination(target.dataset.value);
   if (action === "removeRouteDraft") {
     routeStopDrafts = routeStopDrafts.filter((_, index) => index !== Number(target.dataset.index));
     render();
@@ -1147,6 +1442,9 @@ function handleAction(event) {
     selectedCompanyVehicleId = Number(target.value);
     message = "";
     render();
+  }
+  if (action === "pricingMode") {
+    updatePricingFields(target.value);
   }
   if (action === "search") {
     const panel = target.closest(".panel");
@@ -1183,15 +1481,15 @@ function saveCompany(event) {
   };
 
   if (!company.name || !company.email || !company.password) {
-    alert("Company name, admin email, and password are required.");
+    showToast("Company name, admin email, and password are required.");
     return;
   }
   if (!company.email.includes("@") || !company.email.includes(".")) {
-    alert("Please enter a valid company email address.");
+    showToast("Please enter a valid company email address.");
     return;
   }
   if (state.companies.some((item) => item.email.toLowerCase() === company.email && item.id !== company.id)) {
-    alert("Another company already uses that email.");
+    showToast("Another company already uses that email.");
     return;
   }
 
@@ -1231,13 +1529,13 @@ function saveDestination(event) {
   };
 
   if (!destination.name) {
-    alert("Destination name is required.");
+    showToast("Destination name is required.");
     return;
   }
 
   const duplicate = state.destinations.find((item) => item.name.toLowerCase() === destination.name.toLowerCase() && item.id !== destination.id);
   if (duplicate) {
-    alert("That destination already exists.");
+    showToast("That destination already exists.");
     return;
   }
 
@@ -1267,12 +1565,12 @@ function saveVehicle(event) {
   if (!company) return;
   const data = Object.fromEntries(new FormData(event.currentTarget).entries());
   const fare = calculateVehicleFare(data);
-  if (!data.vehicleName.trim() || fare <= 0) {
-    alert("Vehicle name and a valid fare are required.");
+  if (!data.vehicleName.trim() || !data.routeFrom.trim() || !data.routeTo.trim() || fare <= 0) {
+    showToast("Vehicle name, route locations, and a valid fare are required.");
     return;
   }
   if (data.pricingMode === "Per kilometer" && (Number(data.distanceKm || 0) <= 0 || Number(data.pricePerKm || 0) <= 0)) {
-    alert("Distance and price per kilometer are required for kilometer pricing.");
+    showToast("Distance and price per kilometer are required for kilometer pricing.");
     return;
   }
 
@@ -1282,6 +1580,7 @@ function saveVehicle(event) {
     plate: data.vehiclePlate.trim(),
     routeFrom: data.routeFrom.trim(),
     routeTo: data.routeTo.trim(),
+    routeFares: [],
     pricingMode: data.pricingMode,
     distanceKm: Number(data.distanceKm || 0),
     pricePerKm: Number(data.pricePerKm || 0),
@@ -1302,23 +1601,22 @@ function saveRouteStopFare(event) {
   const baseVehicle = company?.vehicles.find((vehicle) => vehicle.id === modal?.vehicleId);
   if (!company || !baseVehicle) return;
 
+  const wasEditingRoute = Boolean(modal?.editingRouteFareId);
   if (routeStopDrafts.length === 0) {
-    addRouteDraft();
+    if (!addRouteDraft()) return;
+    if (wasEditingRoute) return;
   }
 
   if (routeStopDrafts.length === 0) {
-    alert("Add at least one destination and fixed fare.");
+    showToast("Add at least one destination and fixed fare.");
     return;
   }
 
   const routeFares = routeStopDrafts.map((draft, index) => ({
     id: state.nextVehicleId + index,
-    name: baseVehicle.name,
-    plate: baseVehicle.plate,
     routeFrom: baseVehicle.routeFrom,
     routeTo: draft.destinationName,
     destinationId: draft.destinationId,
-    baseRouteTo: baseVehicle.baseRouteTo || baseVehicle.routeTo,
     pricingMode: "Fixed fare",
     distanceKm: 0,
     pricePerKm: 0,
@@ -1326,7 +1624,14 @@ function saveRouteStopFare(event) {
     status: "Active",
   }));
 
-  state.companies = state.companies.map((item) => (item.id === company.id ? { ...item, vehicles: [...item.vehicles, ...routeFares] } : item));
+  state.companies = state.companies.map((item) =>
+    item.id === company.id
+      ? {
+          ...item,
+          vehicles: item.vehicles.map((vehicle) => (vehicle.id === baseVehicle.id ? { ...vehicle, routeFares: [...(vehicle.routeFares || []), ...routeFares] } : vehicle)),
+        }
+      : item,
+  );
   state.nextVehicleId += routeFares.length;
   selectedCompanyVehicleId = routeFares[routeFares.length - 1].id;
   routeStopDrafts = [];
@@ -1337,37 +1642,114 @@ function saveRouteStopFare(event) {
 }
 
 function addRouteDraft() {
-  const selectEl = document.querySelector("#routeStopDestination");
+  const company = state.companies.find((item) => item.id === modal?.companyId);
+  const baseVehicle = company?.vehicles.find((vehicle) => vehicle.id === modal?.vehicleId);
+  const destinationEl = document.querySelector("#routeStopDestination");
   const fareEl = document.querySelector("#routeStopFare");
-  const destinationId = Number(selectEl?.value);
-  const destination = state.destinations.find((item) => item.id === destinationId);
+  const destinationValue = destinationEl?.value.trim() || "";
+  let destination = state.destinations.find((item) => item.status === "Active" && passengerDestinationLabel(item).toLowerCase() === destinationValue.toLowerCase());
   const fare = Number(fareEl?.value || 0);
 
-  if (!destination || fare <= 0) {
-    alert("Choose a destination and enter a valid fixed fare.");
-    return;
+  if (!destinationValue || fare <= 0) {
+    showToast("Type a destination and enter a valid fixed fare.");
+    return false;
+  }
+
+  if (!destination) {
+    if (!destinationValue.split(" - ")[0].trim()) {
+      showToast("Destination name is required.");
+      return false;
+    }
+    destination = createPassengerDestinationFromText(destinationValue);
   }
 
   if (routeStopDrafts.some((draft) => draft.destinationId === destination.id)) {
-    alert("That destination is already in the list.");
-    return;
+    showToast("That destination is already in the list.");
+    return false;
   }
 
-  routeStopDrafts = [...routeStopDrafts, { destinationId: destination.id, destinationName: destination.name, fare }];
+  if (modal?.editingRouteFareId && company && baseVehicle) {
+    const duplicateRoute = (baseVehicle.routeFares || []).find((routeFare) => routeFare.id !== modal.editingRouteFareId && routeFare.destinationId === destination.id);
+    if (duplicateRoute) {
+      showToast("That destination is already saved for this bus.");
+      return false;
+    }
+
+    state.companies = state.companies.map((item) =>
+      item.id === company.id
+        ? {
+            ...item,
+            vehicles: item.vehicles.map((vehicle) =>
+              vehicle.id === baseVehicle.id
+                ? {
+                    ...vehicle,
+                    routeFares: (vehicle.routeFares || []).map((routeFare) =>
+                      routeFare.id === modal.editingRouteFareId
+                        ? { ...routeFare, routeTo: passengerDestinationLabel(destination), destinationId: destination.id, fare }
+                        : routeFare,
+                    ),
+                  }
+                : vehicle,
+            ),
+          }
+        : item,
+    );
+    selectedCompanyVehicleId = modal.editingRouteFareId;
+    modal = { ...modal, editingRouteFareId: null };
+    persist();
+    showToast(`${passengerDestinationLabel(destination)} route updated.`, "success");
+    return true;
+  }
+
+  routeStopDrafts = [...routeStopDrafts, { destinationId: destination.id, destinationName: passengerDestinationLabel(destination), fare }];
+  persist();
+  showToast(`${passengerDestinationLabel(destination)} added to the route list.`, "success");
+  return true;
+}
+
+function editRouteFare(routeFareId) {
+  routeStopDrafts = [];
+  modal = { ...modal, editingRouteFareId: routeFareId };
   render();
 }
 
+function createPassengerDestinationFromText(value) {
+  const [namePart, ...areaParts] = value.split(" - ");
+  const destination = {
+    id: state.nextDestinationId,
+    name: namePart.trim(),
+    area: areaParts.join(" - ").trim(),
+    status: "Active",
+  };
+  state.destinations = [destination, ...state.destinations];
+  state.nextDestinationId += 1;
+  return destination;
+}
+
 function filterRouteDestinations(query) {
-  const selectEl = document.querySelector("#routeStopDestination");
-  if (!selectEl) return;
-  const normalized = query.toLowerCase();
-  const filtered = state.destinations.filter((destination) => {
-    if (destination.status !== "Active") return false;
-    return [destination.name, destination.area].join(" ").toLowerCase().includes(normalized);
-  });
-  selectEl.innerHTML = filtered
-    .map((destination) => `<option value="${destination.id}">${escapeHtml(destination.name)}${destination.area ? ` - ${escapeHtml(destination.area)}` : ""}</option>`)
-    .join("");
+  const list = document.querySelector("#passengerDestinationList");
+  const combobox = document.querySelector("#routeDestinationCombobox");
+  if (!list || !combobox) return;
+  list.innerHTML = renderRouteDestinationOptions(query);
+  combobox.classList.add("open");
+}
+
+function toggleRouteDestinationOptions() {
+  const inputEl = document.querySelector("#routeStopDestination");
+  const list = document.querySelector("#passengerDestinationList");
+  const combobox = document.querySelector("#routeDestinationCombobox");
+  if (!inputEl || !list || !combobox) return;
+  list.innerHTML = renderRouteDestinationOptions(inputEl.value);
+  combobox.classList.toggle("open");
+  inputEl.focus();
+}
+
+function selectRouteDestination(value) {
+  const inputEl = document.querySelector("#routeStopDestination");
+  const combobox = document.querySelector("#routeDestinationCombobox");
+  if (!inputEl || !value) return;
+  inputEl.value = value;
+  combobox?.classList.remove("open");
 }
 
 function deleteVehicle(id) {
@@ -1384,6 +1766,22 @@ function deleteVehicle(id) {
   render();
 }
 
+function deleteRouteFare(vehicleId, routeFareId) {
+  const company = state.companies.find((item) => item.id === state.sessionCompanyId);
+  if (!company) return;
+  const vehicle = company.vehicles.find((item) => item.id === vehicleId);
+  const routeFare = vehicle?.routeFares?.find((item) => item.id === routeFareId);
+  if (!vehicle || !routeFare || !confirm(`Delete ${routeFare.routeTo}?`)) return;
+  state.companies = state.companies.map((item) =>
+    item.id === company.id
+      ? { ...item, vehicles: item.vehicles.map((v) => (v.id === vehicleId ? { ...v, routeFares: (v.routeFares || []).filter((fare) => fare.id !== routeFareId) } : v)) }
+      : item,
+  );
+  if (selectedCompanyVehicleId === routeFareId) selectedCompanyVehicleId = vehicleId;
+  persist();
+  render();
+}
+
 function publicRegister(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -1393,17 +1791,17 @@ function publicRegister(event) {
   const password = data.publicPassword.trim();
 
   if (!name || !email || !password || !data.publicGovIdNumber.trim()) {
-    alert("Full name, email, password, and government ID number are required.");
+    showToast("Full name, email, password, and government ID number are required.");
     return;
   }
 
   if (!email.includes("@") || !email.includes(".")) {
-    alert("Please enter a valid email address.");
+    showToast("Please enter a valid email address.");
     return;
   }
 
   if (state.accounts.some((account) => account.email?.toLowerCase() === email)) {
-    alert("An account with that email already exists.");
+    showToast("An account with that email already exists.");
     return;
   }
 
@@ -1453,18 +1851,18 @@ function savePassenger(event) {
   };
 
   if (!passenger.name || !passenger.govIdNumber) {
-    alert("Name and government ID number are required.");
+    showToast("Name and government ID number are required.");
     return;
   }
 
   if (passenger.email && (!passenger.email.includes("@") || !passenger.email.includes("."))) {
-    alert("Please enter a valid email address.");
+    showToast("Please enter a valid email address.");
     return;
   }
 
   const emailOwner = state.accounts.find((account) => account.email?.toLowerCase() === passenger.email && account.passengerId !== passenger.id);
   if (passenger.email && emailOwner) {
-    alert("Another passenger account already uses that email.");
+    showToast("Another passenger account already uses that email.");
     return;
   }
 
@@ -1551,7 +1949,7 @@ function deductFare(amount, details = {}) {
 
 function companyDeductFare() {
   const company = state.companies.find((item) => item.id === state.sessionCompanyId);
-  const vehicle = company?.vehicles.find((item) => item.id === selectedCompanyVehicleId);
+  const vehicle = companyFareProfiles(company).find((item) => item.id === selectedCompanyVehicleId);
   if (!company || !vehicle) {
     message = "No active vehicle selected.";
     render();
