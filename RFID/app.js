@@ -728,7 +728,6 @@ function renderDashboard() {
         <h2>Admin Console</h2>
         <p>Monitor card activity, operator setup, passenger balances, and route readiness from one overview.</p>
       </div>
-      <button class="btn primary" data-action="view" data-view="register">${icon("plus")} Register Card</button>
     </section>
     <section class="dashboard-grid">
       <div class="panel compact-panel">
